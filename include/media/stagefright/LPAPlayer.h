@@ -93,6 +93,8 @@ private:
     bool mA2DPEnabled;
     int32_t mChannelMask;
     int32_t numChannels;
+    int32_t mNumOutputChannels;
+    int32_t mNumInputChannels;
     int32_t mSampleRate;
     int64_t mLatencyUs;
     size_t mFrameSize;
@@ -204,6 +206,9 @@ private:
     void handleA2DPSwitch();
     void onPauseTimeOut();
 
+    int64_t getMediaTimeUs_l();
+    bool seekTooClose(int64_t);
+
     sp<AudioFlingerLPAdecodeClient> AudioFlingerClient;
     friend class AudioFlingerLPAdecodeClient;
     Mutex AudioFlingerLock;
@@ -258,6 +263,8 @@ private:
         MediaPlayerBase::AudioSink *audioSink,
         void *buffer, size_t size, void *cookie);
     size_t AudioCallback(void *cookie, void *data, size_t size);
+
+    void convertMonoToStereo(int16_t *data, size_t size);
 
     LPAPlayer(const LPAPlayer &);
     LPAPlayer &operator=(const LPAPlayer &);

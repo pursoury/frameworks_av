@@ -1,6 +1,9 @@
 /*
  * Copyright (C) 2009 The Android Open Source Project
- * Copyright (c) 2010 - 2012, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2010-2013, The Linux Foundation. All rights reserved.
+ *
+ * Not a Contribution, Apache license notifications and license are retained
+ * for attribution purposes only.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,6 +36,9 @@
 #ifdef QCOM_HARDWARE
 #include <media/stagefright/ExtendedWriter.h>
 #include <media/stagefright/WAVEWriter.h>
+#endif
+#ifdef QCOM_FM_ENABLED
+#include <media/stagefright/FMA2DPWriter.h>
 #endif
 #include <media/stagefright/CameraSource.h>
 #include <media/stagefright/CameraSourceTimeLapse.h>
@@ -442,6 +448,11 @@ status_t StagefrightRecorder::setParamMaxFileSizeBytes(int64_t bytes) {
         ALOGW("Target file size (%lld bytes) is too small to be respected", bytes);
     }
 
+    if (bytes >= 0xffffffffLL) {
+        ALOGW("Target file size (%lld bytes) too larger than supported, clip to 4GB", bytes);
+        bytes = 0xffffffffLL;
+    }
+
     mMaxFileSizeBytes = bytes;
     return OK;
 }
@@ -759,7 +770,18 @@ status_t StagefrightRecorder::setListener(const sp<IMediaRecorderClient> &listen
 }
 
 status_t StagefrightRecorder::prepare() {
-    return OK;
+  ALOGV(" %s E", __func__ );
+
+  if(mVideoSource != VIDEO_SOURCE_LIST_END && mVideoEncoder != VIDEO_ENCODER_LIST_END && mVideoHeight && mVideoWidth &&             /*Video recording*/
+         (mMaxFileDurationUs <=0 ||             /*Max duration is not set*/
+         (mVideoHeight * mVideoWidth < 720 * 1280 && mMaxFileDurationUs > 30*60*1000*1000) ||
+         (mVideoHeight * mVideoWidth >= 720 * 1280 && mMaxFileDurationUs > 10*60*1000*1000))) {
+    /*Above Check can be further optimized for lower resolutions to reduce file size*/
+    ALOGV("File is huge so setting 64 bit file offsets");
+    setParam64BitFileOffset(true);
+  }
+  ALOGV(" %s X", __func__ );
+  return OK;
 }
 
 status_t StagefrightRecorder::start() {
@@ -771,6 +793,10 @@ status_t StagefrightRecorder::start() {
     }
 
     status_t status = OK;
+#ifdef QCOM_FM_ENABLED
+    if(AUDIO_SOURCE_FM_RX_A2DP == mAudioSource)
+        return startFMA2DPWriter();
+#endif
 
     switch (mOutputFormat) {
         case OUTPUT_FORMAT_DEFAULT:
@@ -1035,6 +1061,23 @@ status_t StagefrightRecorder::startRawAudioRecording() {
 
     return OK;
 }
+
+#ifdef QCOM_FM_ENABLED
+status_t StagefrightRecorder::startFMA2DPWriter() {
+    /* FM soc outputs at 48k */
+    mSampleRate = 48000;
+    mAudioChannels = 2;
+
+    sp<MetaData> meta = new MetaData;
+    meta->setInt32(kKeyChannelCount, mAudioChannels);
+    meta->setInt32(kKeySampleRate, mSampleRate);
+
+    mWriter = new FMA2DPWriter();
+    mWriter->setListener(mListener);
+    mWriter->start(meta.get());
+    return OK;
+}
+#endif
 
 status_t StagefrightRecorder::startRTPRecording() {
     CHECK_EQ(mOutputFormat, OUTPUT_FORMAT_RTP_AVP);

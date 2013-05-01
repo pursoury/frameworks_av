@@ -1,9 +1,8 @@
 /*
 **
 ** Copyright 2007, The Android Open Source Project
-** Copyright (c) 2011-2012, The Linux Foundation. All rights reserved.
+** Copyright (c) 2011-2013, The Linux Foundation. All rights reserved.
 **
-** Copyright (c) 2012, The Linux Foundation. All rights reserved.
 ** Not a Contribution, Apache license notifications and license are retained
 ** for attribution purposes only.
 **
@@ -107,6 +106,7 @@
 
 #ifdef QCOM_HARDWARE
 #define DIRECT_TRACK_EOS 1
+#define DIRECT_TRACK_HW_FAIL 6
 static const char lockName[] = "DirectTrack";
 #endif
 
@@ -249,6 +249,9 @@ AudioFlinger::AudioFlinger()
       mNextUniqueId(1),
       mMode(AUDIO_MODE_INVALID),
       mBtNrecIsOff(false)
+#ifdef QCOM_HARDWARE
+      ,mAllChainsLocked(false)
+#endif
 {
 }
 
@@ -1051,6 +1054,7 @@ status_t AudioFlinger::setStreamVolume(audio_stream_type_t stream, float value,
             ALOGV("setStreamVolume for mAudioTracks size %d desc %p",mDirectAudioTracks.size(),desc);
             if (desc->mStreamType == stream) {
                 mStreamTypes[stream].volume = value;
+                desc->mVolumeScale = value;
                 desc->stream->set_volume(desc->stream,
                                          desc->mVolumeLeft * mStreamTypes[stream].volume,
                                          desc->mVolumeRight* mStreamTypes[stream].volume);
@@ -1161,9 +1165,29 @@ status_t AudioFlinger::setParameters(audio_io_handle_t ioHandle, const String8& 
             }
             mHardwareStatus = AUDIO_HW_IDLE;
         }
+#ifdef QCOM_HARDWARE
+        AudioParameter param = AudioParameter(keyValuePairs);
+        String8 value, key;
+        int i = 0;
+
+        key = String8(AudioParameter::keyADSPStatus);
+        if (param.get(key, value) == NO_ERROR) {
+            ALOGV("Set keyADSPStatus:%s", value.string());
+            if (value == "ONLINE" || value == "OFFLINE") {
+               if (!mDirectAudioTracks.isEmpty()) {
+                   for (i=0; i < mDirectAudioTracks.size(); i++) {
+                       mDirectAudioTracks.valueAt(i)->stream->common.set_parameters(
+                          &mDirectAudioTracks.valueAt(i)->stream->common, keyValuePairs.string());
+                   }
+               }
+           }
+        }
+#else
         // disable AEC and NS if the device is a BT SCO headset supporting those pre processings
         AudioParameter param = AudioParameter(keyValuePairs);
         String8 value;
+#endif
+
         if (param.get(String8(AUDIO_PARAMETER_KEY_BT_NREC), value) == NO_ERROR) {
             bool btNrecIsOff = (value == AUDIO_PARAMETER_VALUE_OFF);
             if (mBtNrecIsOff != btNrecIsOff) {
@@ -1354,6 +1378,29 @@ status_t AudioFlinger::getRenderPosition(uint32_t *halFrames, uint32_t *dspFrame
 
     return BAD_VALUE;
 }
+
+#ifdef QCOM_FM_ENABLED
+status_t AudioFlinger::setFmVolume(float value)
+{
+    status_t ret = initCheck();
+    if (ret != NO_ERROR) {
+        return ret;
+    }
+
+    // check calling permissions
+    if (!settingsAllowed()) {
+        return PERMISSION_DENIED;
+    }
+
+    AutoMutex lock(mHardwareLock);
+    audio_hw_device_t *dev = mPrimaryHardwareDev->hwDevice();
+    mHardwareStatus = AUDIO_SET_FM_VOLUME;
+    ret = dev->set_fm_volume(dev, value);
+    mHardwareStatus = AUDIO_HW_IDLE;
+
+    return ret;
+}
+#endif
 
 void AudioFlinger::registerClient(const sp<IAudioFlingerClient>& client)
 {
@@ -6163,6 +6210,7 @@ AudioFlinger::DirectAudioTrack::DirectAudioTrack(const sp<AudioFlinger>& audioFl
 
         allocateBufPool();
     }
+    outputDesc->mVolumeScale = 1.0;
     mDeathRecipient = new PMDeathRecipient(this);
     acquireWakeLock();
 }
@@ -6187,16 +6235,17 @@ AudioFlinger::DirectAudioTrack::~DirectAudioTrack() {
 }
 
 status_t AudioFlinger::DirectAudioTrack::start() {
+    AudioSystem::startOutput(mOutput, (audio_stream_type_t)mOutputDesc->mStreamType);
     if(mIsPaused) {
         mIsPaused = false;
         mOutputDesc->stream->start(mOutputDesc->stream);
     }
     mOutputDesc->mActive = true;
-    AudioSystem::startOutput(mOutput, (audio_stream_type_t)mOutputDesc->mStreamType);
     return NO_ERROR;
 }
 
 void AudioFlinger::DirectAudioTrack::stop() {
+    ALOGV("DirectAudioTrack::stop");
     mOutputDesc->mActive = false;
     mOutputDesc->stream->stop(mOutputDesc->stream);
     AudioSystem::stopOutput(mOutput, (audio_stream_type_t)mOutputDesc->mStreamType);
@@ -6245,9 +6294,12 @@ void AudioFlinger::DirectAudioTrack::mute(bool muted) {
 }
 
 void AudioFlinger::DirectAudioTrack::setVolume(float left, float right) {
+    ALOGV("DirectAudioTrack::setVolume left: %f, right: %f", left, right);
     mOutputDesc->mVolumeLeft = left;
     mOutputDesc->mVolumeRight = right;
-    mOutputDesc->stream->set_volume(mOutputDesc->stream,left,right);
+    mOutputDesc->stream->set_volume(mOutputDesc->stream,
+                                left * mOutputDesc->mVolumeScale,
+                                right* mOutputDesc->mVolumeScale);
 }
 
 int64_t AudioFlinger::DirectAudioTrack::getTimeStamp() {
@@ -6258,8 +6310,18 @@ int64_t AudioFlinger::DirectAudioTrack::getTimeStamp() {
 }
 
 void AudioFlinger::DirectAudioTrack::postEOS(int64_t delayUs) {
+#ifdef QCOM_HARDWARE
+    if (delayUs == 0 ) {
+       ALOGV("Notify Audio Track of EOS event");
+       mClient->notify(DIRECT_TRACK_EOS);
+    } else {
+       ALOGV("Notify Audio Track of hardware failure event");
+       mClient->notify(DIRECT_TRACK_HW_FAIL);
+    }
+#else
     ALOGV("Notify Audio Track of EOS event");
     mClient->notify(DIRECT_TRACK_EOS);
+#endif
 }
 
 void AudioFlinger::DirectAudioTrack::allocateBufPool() {
@@ -8703,11 +8765,19 @@ void AudioFlinger::ThreadBase::lockEffectChains_l(
         Vector< sp<AudioFlinger::EffectChain> >& effectChains)
 {
     effectChains = mEffectChains;
+#ifdef QCOM_HARDWARE
+    mAudioFlinger->mAllChainsLocked = true;
+#endif
     for (size_t i = 0; i < mEffectChains.size(); i++) {
 #ifdef QCOM_HARDWARE
-        if (mEffectChains[i] != mAudioFlinger->mLPAEffectChain)
+        if (mEffectChains[i] != mAudioFlinger->mLPAEffectChain) {
 #endif
             mEffectChains[i]->lock();
+#ifdef QCOM_HARDWARE
+        } else {
+            mAudioFlinger-> mAllChainsLocked = false;
+        }
+#endif
     }
 }
 
@@ -8716,7 +8786,7 @@ void AudioFlinger::ThreadBase::unlockEffectChains(
 {
     for (size_t i = 0; i < effectChains.size(); i++) {
 #ifdef QCOM_HARDWARE
-        if (mEffectChains[i] != mAudioFlinger->mLPAEffectChain)
+        if (mAudioFlinger-> mAllChainsLocked || mEffectChains[i] != mAudioFlinger->mLPAEffectChain)
 #endif
             effectChains[i]->unlock();
     }
